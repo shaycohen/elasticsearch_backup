@@ -1,0 +1,17 @@
+services:
+  es:
+    image: elasticsearch:6.4.0
+    platform: linux/amd64
+    ports:
+      - 0.0.0.0:19200:9200
+    environment:
+      - discovery.type=single-node
+    security_opt:
+      - seccomp=unconfined
+    volumes:
+      - ./es-backup:/usr/share/elasticsearch/backup
+      - ./elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml
+
+
+
+
