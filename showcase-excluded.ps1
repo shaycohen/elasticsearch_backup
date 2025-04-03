@@ -1,3 +1,4 @@
+#Below is a script configured to exclude a specific index (in this example, log-index) from being backed up during the snapshot process:
 $ES_URL = "http://localhost:19200"
 $INDEX = "test-index"
 $REPO = "my_backup"
