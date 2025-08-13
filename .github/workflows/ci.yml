@@ -8,7 +8,7 @@ on:
 jobs:
   e2e:
     # Run on your Mac's self-hosted runner
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: [self-hosted, macOS, X64]
     timeout-minutes: 35
 
     steps:
