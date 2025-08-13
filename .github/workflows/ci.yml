@@ -18,18 +18,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq curl
 
-      # ES 6.x needs this kernel setting
-      - name: Set vm.max_map_count
+      - name: Kernel setting for ES
         run: sudo sysctl -w vm.max_map_count=262144
 
-      # Ensure snapshot dir perms for ES container user (uid 1000, gid 0)
-      - name: Prepare snapshot directory with correct ownership
+      # Ensure the mounted backup dir is writable by the ES user (uid 1000, gid 0)
+      - name: Prepare snapshot directory
         run: |
           sudo mkdir -p es-backup
           sudo chown -R 1000:0 es-backup
           sudo chmod -R 775 es-backup
 
-      # Add runtime compose override for heap + ulimits
+      # Small runtime override: heap + ulimits for ES 6.x
       - name: Create docker-compose.override.yaml
         run: |
           cat > docker-compose.override.yaml <<'YAML'
@@ -45,51 +44,32 @@ jobs:
                   soft: 65536
                   hard: 65536
           YAML
-          cat docker-compose.override.yaml
 
-      - name: Start Elasticsearch via Docker Compose
+      - name: Start Elasticsearch
         run: |
           docker compose up -d
-          docker ps
+          docker compose ps
 
-      - name: Verify container is running (compose-aware)
-        run: |
-          # Wait up to ~30s for the "es" service to be in running state
-          for i in {1..30}; do
-            RUNNING=$(docker compose ps --services --status=running | grep -E '^es$' || true)
-            if [ -n "$RUNNING" ]; then
-              echo "ES service is running."
-              docker compose ps
-              exit 0
-            fi
-            echo "Waiting for ES service to be running ($i/30)..."
-            docker compose ps
-            sleep 1
-          done
-          echo "ES service failed to reach running state."
-          docker compose logs es || true
-          exit 1
-
-      - name: Wait for Elasticsearch HTTP to be ready
+      - name: Wait for Elasticsearch HTTP
         env:
           ES_URL: http://localhost:19200
         run: |
           set -euo pipefail
           for i in {1..120}; do
             if curl -s "$ES_URL/_cluster/health" | jq -e '.status=="yellow" or .status=="green"' >/dev/null; then
-              echo "Elasticsearch is up"
+              echo "Elasticsearch is ready"
               curl -s "$ES_URL" | jq .
               exit 0
             fi
-            echo "Waiting for ES HTTP ($i/120)..."
+            echo "Waiting for ES ($i/120)..."
             sleep 2
           done
-          echo "Elasticsearch did not become ready in time"
-          docker compose logs es || true
-          exit 1
+          echo "ES not ready in time"; docker compose logs es || true; exit 1
 
       - name: Make script executable
         run: chmod +x ./showcase.sh
+
+      # ==== Do what you did locally ====
 
       - name: Initialize snapshot repository
         run: ./showcase.sh snapshot_init
@@ -97,14 +77,39 @@ jobs:
       - name: Seed index with baseline data
         run: ./showcase.sh init
 
-      - name: Verify baseline value for doc 1
-        run: |
-          VAL=$(curl -s http://localhost:19200/test-index/_doc/1 | jq -r '._source.value')
-          echo "Initial value: $VAL"
-          test "$VAL" = "1"
-
-      - name: Take snapshot
+      - name: Take snapshot (block until done)
         run: ./showcase.sh snapshot_take
+
+      - name: Show snapshot details via API
+        run: |
+          echo "== All snapshots in repo =="
+          curl -s http://localhost:19200/_snapshot/my_backup/_all | jq .
+          echo "== Latest snapshot only =="
+          LATEST=$(curl -s http://localhost:19200/_snapshot/my_backup/_all | jq -r '.snapshots[-1].snapshot')
+          curl -s "http://localhost:19200/_snapshot/my_backup/$LATEST" | jq .
+
+      - name: Show snapshot files on disk
+        run: |
+          echo "== es-backup contents =="
+          ls -la es-backup || true
+          META_FILE=$(ls -t es-backup/meta-*.dat 2>/dev/null | head -n 1 || true)
+          if [ -n "$META_FILE" ]; then
+            echo "== Preview of $META_FILE =="
+            sed -n '1,200p' "$META_FILE"
+          else
+            echo "No meta-*.dat found."
+          fi
+
+      - name: Upload snapshot artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: elasticsearch-snapshots
+          path: es-backup/
+          if-no-files-found: warn
+          retention-days: 14
+
+      # ==== Round-trip: modify -> restore -> verify ====
 
       - name: Modify doc 1 (simulate bad change)
         run: |
@@ -122,24 +127,13 @@ jobs:
             VAL=$(curl -s http://localhost:19200/test-index/_doc/1 | jq -r '._source.value')
             echo "Attempt $i: Restored value: $VAL"
             if [ "$VAL" = "1" ]; then
-              echo "Restored correctly"
-              exit 0
+              echo "Restored correctly"; exit 0
             fi
             sleep 1
           done
-          echo "Value was never restored correctly"
+          echo "Value never restored correctly"
           docker compose logs es || true
           exit 1
-
-      - name: List snapshots (for logs)
-        run: ./showcase.sh snapshot_list
-
-      - name: Upload snapshot artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: elasticsearch-snapshots
-          path: es-backup/
-          if-no-files-found: warn
 
       - name: Teardown
         if: always()
