@@ -1,4 +1,4 @@
-name: elasticsearch-ci
+name: elasticsearch-ci (self-hosted on Mac)
 
 on:
   push:
@@ -7,28 +7,26 @@ on:
 
 jobs:
   e2e:
-    runs-on: ubuntu-22.04
+    # Run on your Mac's self-hosted runner
+    runs-on: [self-hosted, local-mac]
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install jq & curl
+      - name: Ensure jq & curl present (Homebrew)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y jq curl
+          which jq || (brew update && brew install jq)
+          which curl || echo "curl is built-in on macOS"
 
-      - name: Kernel setting for ES
-        run: sudo sysctl -w vm.max_map_count=262144
-
-      # Ensure the mounted backup dir is writable by the ES user (uid 1000, gid 0)
-      - name: Prepare snapshot directory
+      # Make sure the local host folder exists and is writable by the container
+      - name: Prepare local backup folder (bind mount target)
         run: |
-          sudo mkdir -p es-backup
-          sudo chown -R 1000:0 es-backup
-          sudo chmod -R 775 es-backup
+          mkdir -p es-backup
+          chmod -R 777 es-backup
 
-      # Small runtime override: heap + ulimits for ES 6.x
+      # Optional override for ES heap/ulimits. Docker Desktop ignores host sysctl,
+      # but ES 6.x usually works fine on Mac with single-node.
       - name: Create docker-compose.override.yaml
         run: |
           cat > docker-compose.override.yaml <<'YAML'
@@ -45,7 +43,7 @@ jobs:
                   hard: 65536
           YAML
 
-      - name: Start Elasticsearch
+      - name: Start Elasticsearch locally (on your Mac)
         run: |
           docker compose up -d
           docker compose ps
@@ -69,15 +67,14 @@ jobs:
       - name: Make script executable
         run: chmod +x ./showcase.sh
 
-      # ==== Do what you did locally ====
-
+      # === same flow you ran manually ===
       - name: Initialize snapshot repository
         run: ./showcase.sh snapshot_init
 
       - name: Seed index with baseline data
         run: ./showcase.sh init
 
-      - name: Take snapshot (block until done)
+      - name: Take snapshot (waits)
         run: ./showcase.sh snapshot_take
 
       - name: Show snapshot details via API
@@ -88,29 +85,16 @@ jobs:
           LATEST=$(curl -s http://localhost:19200/_snapshot/my_backup/_all | jq -r '.snapshots[-1].snapshot')
           curl -s "http://localhost:19200/_snapshot/my_backup/$LATEST" | jq .
 
-      - name: Show snapshot files on disk
+      - name: List files in your local es-backup (on this Mac)
         run: |
-          echo "== es-backup contents =="
+          echo "== es-backup contents (host) =="
           ls -la es-backup || true
-          META_FILE=$(ls -t es-backup/meta-*.dat 2>/dev/null | head -n 1 || true)
-          if [ -n "$META_FILE" ]; then
-            echo "== Preview of $META_FILE =="
-            sed -n '1,200p' "$META_FILE"
-          else
-            echo "No meta-*.dat found."
-          fi
+          echo
+          echo "== Mounts inside the container =="
+          CID=$(docker compose ps -q es)
+          docker exec "$CID" sh -lc 'ls -la /usr/share/elasticsearch/backup || true'
 
-      - name: Upload snapshot artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: elasticsearch-snapshots
-          path: es-backup/
-          if-no-files-found: warn
-          retention-days: 14
-
-      # ==== Round-trip: modify -> restore -> verify ====
-
+      # Round-trip: modify -> restore -> verify
       - name: Modify doc 1 (simulate bad change)
         run: |
           ./showcase.sh modify 1
@@ -135,9 +119,10 @@ jobs:
           docker compose logs es || true
           exit 1
 
-      - name: Teardown
+      # Keep containers but you can change to "down -v" if you like; bind mount persists anyway.
+      - name: Teardown containers (keep local backup folder)
         if: always()
         run: |
           docker compose logs es || true
-          docker compose down -v
+          docker compose down
 
