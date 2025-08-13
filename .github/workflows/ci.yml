@@ -18,30 +18,73 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq curl
 
-      # ES 6.x needs this higher mmap count on the host
+      # ES 6.x needs this kernel setting
       - name: Set vm.max_map_count
         run: sudo sysctl -w vm.max_map_count=262144
 
-      - name: Prepare snapshot directory
-        run: mkdir -p es-backup
+      # Ensure the snapshot dir is writable by the ES container user (uid 1000, gid 0)
+      - name: Prepare snapshot directory with correct ownership
+        run: |
+          sudo mkdir -p es-backup
+          sudo chown -R 1000:0 es-backup
+          sudo chmod -R 775 es-backup
+
+      # Add a compose override at runtime for heap + ulimits (no repo changes needed)
+      - name: Create docker-compose.override.yaml
+        run: |
+          cat > docker-compose.override.yaml <<'YAML'
+          services:
+            es:
+              environment:
+                - ES_JAVA_OPTS=-Xms512m -Xmx512m
+              ulimits:
+                memlock:
+                  soft: -1
+                  hard: -1
+                nofile:
+                  soft: 65536
+                  hard: 65536
+          YAML
+          cat docker-compose.override.yaml
 
       - name: Start Elasticsearch via Docker Compose
         run: |
           docker compose up -d
           docker ps
 
-      - name: Wait for Elasticsearch to be ready
+      - name: Verify container is running
+        run: |
+          # Wait up to ~30s for the container to stay in "running"
+          for i in {1..30}; do
+            if docker ps --filter "name=_es" --filter "status=running" --format '{{.Names}}' | grep -q .; then
+              echo "ES container is running."
+              exit 0
+            fi
+            echo "Waiting for ES container to be running ($i/30)..."
+            sleep 1
+          done
+          echo "ES container failed to reach running state."
+          docker compose ps
+          docker compose logs es || true
+          exit 1
+
+      - name: Wait for Elasticsearch HTTP to be ready
         env:
           ES_URL: http://localhost:19200
         run: |
           set -euo pipefail
-          for i in {1..60}; do
+          for i in {1..120}; do
+            # Ready when cluster is yellow/green
             if curl -s "$ES_URL/_cluster/health" | jq -e '.status=="yellow" or .status=="green"' >/dev/null; then
               echo "Elasticsearch is up"
               curl -s "$ES_URL" | jq .
               exit 0
             fi
-            echo "Waiting for ES ($i/60)..."
+            # Show a quick heartbeat to help debugging
+            if docker ps --filter "name=_es" --format '{{.Status}}' | grep -q .; then
+              docker ps --filter "name=_es"
+            fi
+            echo "Waiting for ES HTTP ($i/120)..."
             sleep 2
           done
           echo "Elasticsearch did not become ready in time"
@@ -76,7 +119,7 @@ jobs:
       - name: Restore latest snapshot
         run: ./showcase.sh snapshot_restore
 
-      # Poll until the restored value is visible; keeps your showcase.sh unmodified if you prefer
+      # Keep showcase.sh unchanged: we poll until the restored value is visible
       - name: Verify data restored from snapshot
         run: |
           for i in {1..30}; do
@@ -89,6 +132,7 @@ jobs:
             sleep 1
           done
           echo "Value was never restored correctly"
+          docker compose logs es || true
           exit 1
 
       - name: List snapshots (for logs)
