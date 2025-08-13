@@ -1,5 +1,5 @@
 name: elasticsearch-ci (self-hosted on Mac)
-##
+
 on:
   push:
     branches: [ main, master ]
