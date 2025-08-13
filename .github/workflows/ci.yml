@@ -1,36 +1,105 @@
-# This is a basic workflow to help you get started with Actions
+name: elasticsearch-ci
 
-name: CI
-
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
   push:
-    branches: [ "main" ]
+    branches: [ main, master ]
   pull_request:
-    branches: [ "main" ]
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
-
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
-    runs-on: ubuntu-latest
+  e2e:
+    runs-on: ubuntu-22.04
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
-
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: Ensure jq & curl present
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      # Elasticsearch (especially 6.x) needs this on the host
+      - name: Set vm.max_map_count
+        run: |
+          sudo sysctl -w vm.max_map_count=262144
+
+      - name: Prepare snapshot directory
+        run: |
+          mkdir -p es-backup
+          ls -la
+
+      - name: Start Docker Compose (Elasticsearch)
+        run: |
+          docker compose up -d
+          docker ps
+
+      - name: Wait for Elasticsearch
+        env:
+          ES_URL: http://localhost:19200
+        run: |
+          set -euo pipefail
+          for i in {1..60}; do
+            if curl -s "$ES_URL/_cluster/health" | jq -e '.status=="yellow" or .status=="green"' >/dev/null; then
+              echo "Elasticsearch is up"
+              curl -s "$ES_URL" | jq .
+              exit 0
+            fi
+            echo "Waiting for ES ($i/60)..."
+            sleep 2
+          done
+          echo "Elasticsearch did not become ready in time"
+          docker compose logs es || true
+          exit 1
+
+      - name: Make showcase.sh executable
+        run: chmod +x ./showcase.sh
+
+      - name: Initialize snapshot repo
+        run: ./showcase.sh snapshot_init
+
+      - name: Create and verify baseline data
+        run: |
+          ./showcase.sh init
+          # Sanity check: doc 1 should be {"value":1}
+          VAL=$(curl -s http://localhost:19200/test-index/_doc/1 | jq -r '._source.value')
+          echo "Initial value: $VAL"
+          test "$VAL" = "1"
+
+      - name: Take snapshot
+        run: ./showcase.sh snapshot_take
+
+      - name: Modify data (should differ from snapshot)
+        run: |
+          ./showcase.sh modify 1
+          VAL=$(curl -s http://localhost:19200/test-index/_doc/1 | jq -r '._source.value')
+          echo "Modified value: $VAL"
+          test "$VAL" = "999999"
+
+      - name: Restore latest snapshot
+        run: ./showcase.sh snapshot_restore
+
+      - name: Verify data restored from snapshot
+        run: |
+          # After restore, doc 1 should be back to value=1
+          # Give a brief moment after open
+          sleep 2
+          VAL=$(curl -s http://localhost:19200/test-index/_doc/1 | jq -r '._source.value')
+          echo "Restored value: $VAL"
+          test "$VAL" = "1"
+
+      - name: List snapshots (for logs)
+        run: ./showcase.sh snapshot_list
+
+      - name: Upload snapshot artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: elasticsearch-snapshots
+          path: es-backup/
+          if-no-files-found: warn
+
+      - name: Teardown
+        if: always()
+        run: |
+          docker compose logs es || true
+          docker compose down -v
+
