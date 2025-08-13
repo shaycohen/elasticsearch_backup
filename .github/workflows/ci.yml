@@ -13,27 +13,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Ensure jq & curl present
+      - name: Install jq & curl
         run: |
           sudo apt-get update
           sudo apt-get install -y jq curl
 
-      # Elasticsearch (especially 6.x) needs this on the host
+      # ES 6.x needs this higher mmap count on the host
       - name: Set vm.max_map_count
-        run: |
-          sudo sysctl -w vm.max_map_count=262144
+        run: sudo sysctl -w vm.max_map_count=262144
 
       - name: Prepare snapshot directory
-        run: |
-          mkdir -p es-backup
-          ls -la
+        run: mkdir -p es-backup
 
-      - name: Start Docker Compose (Elasticsearch)
+      - name: Start Elasticsearch via Docker Compose
         run: |
           docker compose up -d
           docker ps
 
-      - name: Wait for Elasticsearch
+      - name: Wait for Elasticsearch to be ready
         env:
           ES_URL: http://localhost:19200
         run: |
@@ -51,16 +48,17 @@ jobs:
           docker compose logs es || true
           exit 1
 
-      - name: Make showcase.sh executable
+      - name: Make script executable
         run: chmod +x ./showcase.sh
 
-      - name: Initialize snapshot repo
+      - name: Initialize snapshot repository
         run: ./showcase.sh snapshot_init
 
-      - name: Create and verify baseline data
+      - name: Seed index with baseline data
+        run: ./showcase.sh init
+
+      - name: Verify baseline value for doc 1
         run: |
-          ./showcase.sh init
-          # Sanity check: doc 1 should be {"value":1}
           VAL=$(curl -s http://localhost:19200/test-index/_doc/1 | jq -r '._source.value')
           echo "Initial value: $VAL"
           test "$VAL" = "1"
@@ -68,7 +66,7 @@ jobs:
       - name: Take snapshot
         run: ./showcase.sh snapshot_take
 
-      - name: Modify data (should differ from snapshot)
+      - name: Modify doc 1 (simulate bad change)
         run: |
           ./showcase.sh modify 1
           VAL=$(curl -s http://localhost:19200/test-index/_doc/1 | jq -r '._source.value')
@@ -78,14 +76,20 @@ jobs:
       - name: Restore latest snapshot
         run: ./showcase.sh snapshot_restore
 
+      # Poll until the restored value is visible; keeps your showcase.sh unmodified if you prefer
       - name: Verify data restored from snapshot
         run: |
-          # After restore, doc 1 should be back to value=1
-          # Give a brief moment after open
-          sleep 2
-          VAL=$(curl -s http://localhost:19200/test-index/_doc/1 | jq -r '._source.value')
-          echo "Restored value: $VAL"
-          test "$VAL" = "1"
+          for i in {1..30}; do
+            VAL=$(curl -s http://localhost:19200/test-index/_doc/1 | jq -r '._source.value')
+            echo "Attempt $i: Restored value: $VAL"
+            if [ "$VAL" = "1" ]; then
+              echo "Restored correctly"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Value was never restored correctly"
+          exit 1
 
       - name: List snapshots (for logs)
         run: ./showcase.sh snapshot_list
