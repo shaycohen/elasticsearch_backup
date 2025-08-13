@@ -8,7 +8,8 @@ on:
 jobs:
   e2e:
     # Run on your Mac's self-hosted runner
-    runs-on: [self-hosted, local-mac]
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 35
 
     steps:
       - name: Checkout
